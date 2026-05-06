@@ -33,5 +33,6 @@ Follow these steps to develop a custom package in Concrete CMS:
 
 - [Package Structure and Creation](references/package_structure.md)
 - [Installing Entities (Blocks, Themes, Attributes, etc.)](references/install_entities.md)
+- [Creating Attribute Keys (Modern API)](references/attribute_keys.md)
 - [Extending Core Classes](references/extending_core.md)
 - [Registering Routes and Service Providers](references/routing_services.md)
