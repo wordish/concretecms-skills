@@ -5,311 +5,388 @@ description: Apply this skill whenever you are writing, reviewing, or modifying 
 
 # Concrete CMS Security
 
-A skill for writing Concrete CMS code that does not reproduce the failure modes that have repeatedly become CVEs.
+Operational reference for writing or reviewing Concrete CMS PHP. Read top-to-bottom for a new task; jump to **Danger signals** or **Review priorities** when triaging an existing PR.
 
-The patterns below are organized by **what happens if you get this wrong**, not by alphabet. The first section (CRITICAL) covers patterns that produced CVSS 7.0+ outcomes: remote code execution, privilege escalation, and authentication bypass. The second section (HIGH-FREQUENCY) covers patterns that produced the largest *count* of CVEs — mostly medium-severity, but the volume means at least one of them is relevant to almost any code change.
+## Structure
 
-## When to use
+1. **Danger signals** — grep patterns demanding deeper inspection
+2. **Review priorities** — order to inspect a PR, by risk-per-minute
+3. **Critical patterns (C1–C7)** — RCE / privesc / auth bypass
+4. **High-frequency patterns (H1–H7)** — XSS, CSRF, IDOR, SSRF, etc.
+5. **Pre-flight checklist**
+6. **Threat model & history** — actors and recurring patterns
 
-Use this skill any time you touch Concrete CMS PHP. The trigger is the codebase, not the user's framing. If the user says "add a button that bulk-deletes selected logs" they have not mentioned security, but they are asking you to write exactly the kind of endpoint that produced CVE-2023-48652 in 2023 and CVE-2026-8409/8410/8411 in 2026 — three years of the same bug. Read this skill first, then write the code.
+Sections 1–5 are the working reference. Section 6 is evidence.
 
-You do **not** need to read this skill for:
-- Pure documentation, marketing copy, or release-note writing
-- Frontend-only changes (CSS, JS that does not call new endpoints)
-- Reading or summarizing existing code without modifying it
-
-## Threat model
-
-Three attacker profiles dominate the Concrete CMS CVE history. Design defensively against all three:
-
-1. **The rogue admin / editor.** An attacker who already has elevated privileges in the CMS. The Concrete security team explicitly treats this as in-scope — most stored-XSS, deserialization, and path-traversal CVEs assume this attacker. Do not write code that says "this field is only edited by admins, so we trust it." Admin-supplied strings must still be HTML-encoded. Admin-supplied serialized data must not reach `unserialize()`. Admin-supplied file paths must be whitelist-validated.
-
-2. **The unauthenticated attacker triggering a cross-site request against an authenticated victim.** This is the CSRF model. Every state-changing request must validate a CSRF token, including GET requests if they change state. The "victim is an admin" assumption is realistic — most CSRF chains in this codebase target admin sessions.
-
-3. **The unauthenticated outsider hitting a public endpoint.** Dialog, frontend, and REST endpoints have repeatedly been reachable without authentication and have leaked file usage data, conversation messages, page metadata, and survey state. Treat every endpoint as unauthenticated until you have proven otherwise with an explicit permission check.
+Skip this skill only for documentation/marketing copy, frontend-only changes that add no endpoints, or read-only review without modification.
 
 ---
 
-## CRITICAL patterns (produced CVSS 7.0+ CVEs)
+## Danger signals
 
-If you violate any of these, a single mistake can produce a critical-severity vulnerability. Apply these *first*.
+Stop and apply the linked rule if any of these appear.
 
-### C1. Never call `unserialize()` on data that has touched the database, the request, or block configuration
+**RCE class:**
 
-This is a repeat offender. CVE-2021-40102 (PHAR deserialization → file delete), CVE-2026-3452 (block config → RCE, CVSS 8.9), and CVE-2026-8135 (`ExpressEntryList` `filterFields` → RCE, CVSS 8.9) are all PHP object-injection bugs. Object instantiation during unserialize fires magic methods (`__wakeup`, `__destruct`, `__toString`) on attacker-chosen classes — in a framework this large, that is always a full RCE.
+| Signal                                                | Rule             |
+|-------------------------------------------------------|------------------|
+| `unserialize(`                                        | C1               |
+| `phar://`, `file://`, `data://`, `gopher://`          | C1, H4           |
+| `include $x`, `require $x` (variable path)            | C3               |
+| `move_uploaded_file(`                                 | C2               |
+| `uniqid(` used for security/paths                     | C2               |
+| `exec`, `shell_exec`, `system`, `passthru`, backticks | — block entirely |
 
-Rules:
-- Do not use `unserialize()` on any value sourced from the database, the request, a file, or any other channel an admin or attacker could influence.
-- If you must deserialize structured data, use `json_decode()` against a known schema and validate the resulting structure.
-- `phar://` stream wrappers also deserialize. Never pass attacker-influenced paths to `file_exists`, `is_file`, `fopen`, `include`, or similar without filtering `phar:`.
-- Block configuration columns that hold serialized PHP (`btTable_filterFields`, `btTable_columns`, etc.) are a smell. Flag them. Migrate to JSON.
+**Auth / privilege class:**
 
-### C2. Validate file uploads by content, not by extension — and validate *before* writing to disk
+| Signal                                                                      | Rule |
+|-----------------------------------------------------------------------------|------|
+| `$request->request->all()`, raw `$_POST` to update                          | C7   |
+| `File::getByID(`, `Page::getByID(`, `Event::getByID(`, `Express*::getByID(` | H3   |
+| `canAccess()` before a mutation                                             | C5   |
+| `==` in auth/password/token/guard code                                      | C6   |
+| `=== true/false` on a JSON-decoded field                                    | C6   |
+| OAuth callback w/o `state`, session regen, or `uIsActive`                   | C7   |
+| Password/email/2FA change w/o current-password re-verify                    | C7   |
 
-Concrete's file uploader has been the source of multiple RCEs:
-- 2021 Fortbridge race-condition RCE: validations ran *after* the file was already written; an attacker raced the deletion of a rejected upload to execute a PHP web shell.
-- CVE-2022-21829 (CVSS 9.8 / Concrete-team 8.0): the marketplace fetched zip files over HTTP and executed code from them.
-- CVE-2026-8134 (CVSS 9.4): the file uploader allowed PHP code inside `.png` files because it only validated the extension; chained with a path-traversal field, this became authenticated RCE.
+**CSRF / state-change class:**
 
-Rules:
-- Reject by **content type and magic bytes**, not by file extension. A file with extension `.png` containing `<?php` must be rejected at validation, not after `move_uploaded_file()`.
-- Validate **before** the bytes hit any path under the webroot, `application/`, or `DIR_PACKAGES`. If you must stream to disk first, stream to a path that is not executable by the web server.
-- Avoid `uniqid()` and other non-cryptographic randomness for temp directory names. The Fortbridge RCE worked because `uniqid()` is predictable.
-- Disable redirects on server-side fetches that will be executed or unpacked. Validate the final URL, not the original.
-- For zip/archive ingestion, validate every entry name for path traversal before extraction. A `zip` containing `../../something.php` will write outside the intended directory.
+| Signal                                                                                                               | Rule          |
+|----------------------------------------------------------------------------------------------------------------------|---------------|
+| GET routes named `delete`, `download`, `do_update`, `star`, `approve*`, `rescan`, `install_*`, `add/removeFavorite*` | H2, C4        |
+| Mutating controller missing `token->validate(...)`                                                                   | H2            |
+| Token emitted in view but never validated                                                                            | H2            |
+| `if ($valid) throw; else proceed` on token check                                                                     | H2 — inverted |
 
-### C3. Reject path traversal in any field that becomes a file path or template name
+**XSS / output class:**
 
-CVE-2021-40097, CVE-2021-40098 (path traversal → RCE), CVE-2022-30117 (traversal → arbitrary file delete), and CVE-2026-8134 (CVSS 9.4, the highest single score in the past year) all share a shape: a string field is concatenated into a file path that is later read, included, or used as a template.
+| Signal                                                             | Rule |
+|--------------------------------------------------------------------|------|
+| `<?= $var ?>` or `<?php echo $var` without `h()` in template       | H1   |
+| `t('format %s', $userInput)` (translation as format string)        | H1   |
+| `href="<?= $url ?>"`, `value="<?= $x ?>"` without attribute escape | H1   |
+| User-controlled "numeric" field interpolated without cast          | H1   |
 
-Rules:
-- Any field whose value will be concatenated into `require`, `include`, file read, or template render must reject `..`, absolute paths, null bytes, and stream wrappers (`phar://`, `file://`, `data://`, `gopher://`).
-- Use a whitelist of allowed characters (`[A-Za-z0-9_-]`) where possible. Validate after normalization, not before — `..%2f` and `..%252f` are real attacks.
-- Resolve the final path with `realpath()` and confirm it is still under the intended root before opening it.
-- Treat template-name and custom-template fields as code, not data. The framework will literally include the resolved path.
+**File / permission / SSRF / path class:**
 
-### C4. State-changing GETs in package/marketplace/update flows have produced CSRF-to-RCE chains
+| Signal                                                                 | Rule   |
+|------------------------------------------------------------------------|--------|
+| `mkdir(` without explicit permissions argument                         | H6     |
+| `chmod(..., 0777)`                                                     | H6     |
+| `file_get_contents($userUrl)`, Guzzle/cURL on user URL                 | H4     |
+| Redirects followed on server-side fetch without re-validation          | H4, C2 |
+| ZIP/archive extraction without per-entry traversal check               | C2, C3 |
+| String field concatenated into a `$path` that is read/written/included | C3     |
+| `realpath()` not called before opening a constructed path              | C3     |
+| `..` filtering done before URL/path decoding                           | C3     |
 
-CVE-2026-8140, CVE-2026-8417, CVE-2026-8421, CVE-2026-8426, and CVE-2026-8428 are five separate CSRF-to-RCE paths in marketplace install, update, and core-update endpoints (all CVSS 7.5). The pattern: `download()`, `do_update()`, `install_package()`, `prepare_remote_upgrade()` are GET routes guarded only by `canInstallPackages()` or `canUpgrade()`, with no CSRF token check. An attacker who could cause an authenticated admin to visit a page could force package installation or core upgrade — which is RCE.
+**High-risk subtrees** (extra scrutiny for any new code here):
 
-Rules:
-- Routes that install packages, upgrade the core, or write files under `DIR_PACKAGES` MUST validate a CSRF token. The permission check is necessary but not sufficient.
-- If you write a new controller method that fetches, writes, or executes code based on a remote identifier (marketplace ID, package handle, version string), it is a CSRF-to-RCE target by default. Treat it as one.
-- Reject GET for these routes entirely where possible. Require POST with a token tied to a specific action name.
-
-### C5. Check authorization for the *action*, not just for the page
-
-CVE-2026-8350 (CVSS 7.5) was privilege escalation to the Administrator group from the `bulk_user_assignment.php` dashboard page. The page-view permission was the only check, so any authenticated user with access to that dashboard page could add anyone (including themselves) to the Administrators group and remove legitimate admins. CVE-2021-22966 was the same pattern five years earlier — Editor-to-Admin escalation via the bulkupdate page.
-
-Rules:
-- View permission on a page does NOT imply mutation permission for every action exposed by that page. Each action method needs its own permission check that matches the *blast radius* of that action.
-- Adding a user to the Administrators group should require Administrator-level authority, not "can see the bulk assignment dashboard."
-- Group-membership mutations, permission-grant mutations, and user-role changes are privilege-escalation-adjacent. The check should be at least as strict as the privilege being granted.
-
-### C6. Use strict comparisons and strict source validation; never trust loose-typed guards
-
-CVE-2022-43690 was an authentication weakness in the legacy password algorithm because loose comparison (`==`) was used instead of strict comparison (`===`), enabling type-juggling attacks. CVE-2026-8135 (RCE, CVSS 8.9) bypassed a `_fromCIF === true` guard because the request was parsed with `json_decode()`, and `json_decode("true")` returns PHP boolean `true` — defeating the strict check on the value while leaving the request *source* unchecked.
-
-Rules:
-- Use `===` and `!==` for security comparisons. Never `==` in authentication, authorization, or guard code.
-- Validate the *source* of the request (which controller path, which HTTP method, which user role), not just a field value. A "is this an internal CIF import" check that reads its own answer from the request body is not a check.
-- For OAuth `state`, CSRF tokens, password hashes, and similar opaque tokens, use `hash_equals()` for constant-time comparison.
-- Be wary of any value that can be transmitted as JSON: `true`, `false`, `null`, and numeric strings can collapse into PHP scalars that pass `===` against literals.
-
-### C7. Re-authenticate for security-relevant account changes; check `uIsActive` on every auth path
-
-CVE-2021-40101 (admin changing another user's password without re-prompt) and CVE-2026-8327 (raw POST array passed to `UserInfo::update()`, allowing password change without current-password verification and disabling per-user IP pinning) are the same lesson, five years apart. CVE-2026-7887 was an OAuth bypass where suspended accounts (`uIsActive=0`) could still obtain valid API tokens because the OAuth handler did not check account status.
-
-Rules:
-- Whitelist the fields you accept. Never pass `$_POST` or `$request->request->all()` straight to a model update.
-- Password changes, email changes, 2FA changes, and session-hardening toggles require the current password (or a fresh authentication factor) verified server-side.
-- `uIsActive` must be checked at every authentication path: username/password, OAuth callbacks, API token issuance, "remember me" cookies, password-reset flows. A suspended user must be unable to log in via any path.
-- OAuth handlers in particular: treat them as full auth surfaces. Apply the same input validation, output encoding, account-status checks, and session-regeneration that you apply to username/password login. CVE-2022-43687 was missing session-ID rotation on OAuth login; CVE-2022-43693 was a missing `state` parameter enabling CSRF on the OAuth callback itself.
+```
+concrete/controllers/dialog/                         ← 2026 CSRF cluster
+concrete/controllers/backend/file/                   ← CSRF + IDOR
+concrete/controllers/single_page/dashboard/extend/   ← CSRF→RCE (marketplace)
+concrete/controllers/single_page/dashboard/system/update/  ← CSRF→RCE (core)
+concrete/controllers/frontend/conversations/         ← IDOR cluster
+concrete/blocks/express_entry_*/                     ← unserialize RCE × 2
+concrete/blocks/{page_list,search,switch_language,form}/  ← XSS history
+authentication/oauth/                                 ← state, session, uIsActive
+src/File/{Importer*,Service/}                         ← extension-only validation, races
+```
 
 ---
 
-## HIGH-FREQUENCY patterns (produced the bulk of CVEs)
+## Review priorities
 
-These produce mostly medium-severity bugs, but the *count* across four years is large enough that at least one is relevant to almost any code change.
+Inspect in this order; flag at first failure rather than skimming the whole diff.
 
-### H1. HTML-encode every user-controllable string on output, including admin-supplied ones
-
-This is the largest single bug class in Concrete CMS history. Every year, 5-15 stored-XSS CVEs ship. Examples from the past four years:
-- 2022: dashboard breadcrumbs (43556), entity association names (43695), Microsoft tile icon (43688)
-- 2023: API integration names, file tags, layout preset names, calendar color settings, group/role names, dashboard basics name
-- 2024: file tags/descriptions (1245), Role Name (1247), Group Name (2179), calendar event name (7398), Image Editor Background Color (8291), Top Navigator Bar (8660), Next&Previous Nav (8661), Advanced File Search Filter (3178)
-- 2025: Add Folder (0660), Home Folder (8573), Address attribute (3153), Conversation Messages (8571)
-- 2026: Search block (3244), Switch Language (3242), Legacy Form (3240, 3241), OAuth integration name (8197, CVSS 7.3), height parameter (8203, CVSS 7.3), Atomik theme page name (8353), external-link cvName (8139)
-
-The pattern is invariant: a string entered by an admin or editor is later rendered into HTML without escaping. "Only admins can set this" is not a defense — Concrete's security team explicitly treats rogue-admin XSS as in-scope.
-
-Rules:
-- Use `h()` (Concrete's HTML-escape helper) on every user-controllable string in a PHP template. Use `app('helper/text')->entities()` if `h()` is out of scope.
-- Twig auto-escapes by default; this is one of the reasons 9.5.0 added Twig template support. Prefer Twig for new templates.
-- Translation helpers do not sanitize. CVE-2026-8197 (CVSS 7.3) was XSS through `t()` because the integration name was used as a sprintf-style format string. Escape input *before* it enters a format string, or pass it as a separate argument and escape on output.
-- HTML *attribute* injection is also XSS. CVE-2026-8245 was reflected XSS because a URL was interpolated into `href=""` without attribute encoding. Apply `h()` to attribute values.
-- Numeric-looking fields are not safe by default. CVE-2026-8203 (CVSS 7.3) was XSS via a `height` parameter because the controller did not validate that it was a number. Cast or validate types explicitly.
-- Any name/title/label field an editor controls is a potential XSS payload. Page names, file names, folder names, calendar event names, form question text, OAuth integration names, group/role names, Express entity names, layout preset names, search filter names — all of these have shipped stored XSS in this codebase.
-
-### H2. Validate a CSRF token on every state-changing request, including GETs
-
-CSRF was a known pattern by 2022 (CVE-2022-43693 missing OAuth state) and 2023 (CVE-2023-48652 logs delete, CVE-2023-48653 calendar event delete) — and it kept happening through CVE-2025-3153 (Address attribute), CVE-2026-2994 (Anti-Spam Allowlist), CVE-2026-7882 (inverted check on file deletion), and then the 20+ CSRF cluster in 9.5.1.
-
-Rules:
-- **State-changing GET routes are CSRF-vulnerable.** Do not assume "it's a GET, the browser won't preflight." `download()`, `do_update()`, `star()`, `rescan()`, `approveVersion()`, `addFavoriteFolder()`, `removeFavoriteFolder()`, `delete_all/submit`, `event/delete/submit` — all of these were GETs that mutated state and all became CVEs. If the route changes anything on the server, validate a token, regardless of HTTP method. Prefer requiring POST.
-- **Emitting a token in the view does not validate it.** CVE-2026-8428 shipped a token in `local_available_update.php` but `do_update()` never checked it.
-- **Check the result correctly.** CVE-2026-7882 was an *inverted* CSRF check: it threw on valid tokens and proceeded on invalid ones. Always test by removing the token from the request — the action must fail.
-- Use `$this->app->make('token')->validate('action_name')`. Pair it with the emission point.
-- New endpoints under `concrete/controllers/dialog`, `concrete/controllers/backend/file`, `concrete/controllers/single_page/dashboard/extend`, `concrete/controllers/single_page/dashboard/system/update`, and any package-related controller — audit the token validation explicitly. These subtrees have a poor track record.
-
-### H3. Check per-object authorization on every load, not just at the controller entry point
-
-CVE-2021-22951 and CVE-2021-22967 (IDOR via conversations/file access), CVE-2023-48653 (sequential event IDs explicitly called out), and then 10+ IDOR CVEs in 9.5.1: CVE-2026-6826, -8236, -8237, -8238, -8239, -7879, -7881, -7886, -8204, -8205, -8337, -8240, -8347. The pattern: a controller accepts an integer ID, looks up the corresponding object, and returns it without asking whether *this user* may see *this object*.
-
-Rules:
-- Every controller method that loads an object by ID must call the relevant permission check before returning data or mutating: `canViewFile()`, `canViewPage()`, `canView()` on the calendar, `canEditPageContents()`, etc.
-- Existence-checking endpoints leak too. CVE-2026-8239 disclosed message existence via the rating endpoint. If the endpoint behaves differently for "exists but you can't see it" versus "doesn't exist," that is an information disclosure. Return 404 for both.
-- Frontend endpoints under `/ccm/frontend/conversations`, `/ccm/system/dialogs/file/usage`, calendar `action_get_events`, and Express `exEntryID`-driven endpoints have a poor history. Permission checks here are not optional.
-- For sequential numeric IDs that gate access, assume the attacker will enumerate. Prefer public-identifier strings (UUIDs) — Concrete itself moved Express Entry blocks from sequential IDs to public identifiers in 9.5.1 specifically because of this.
-
-### H4. Validate and pin the destination of every server-side URL fetch
-
-SSRF has been hit repeatedly: CVE-2021-22969 (DNS rebinding to cloud IAAS keys), CVE-2021-22970 (local IP imports), CVE-2021-40109 (big-endian/hex/octal IP variants, redirect-on-upload), CVE-2026-7890 (RSS Displayer SSRF).
-
-Rules:
-- Use the `Concrete\Core\Url\Validation` utilities added in 9.5.1 for new URL handling. The previous patchwork was insufficient.
-- Resolve the hostname yourself, validate the resolved IP is not in any private range (RFC1918, link-local, loopback, IPv6 equivalents, IPv4-mapped IPv6, and cloud metadata IPs like 169.254.169.254), and connect using that IP (not the hostname) to defeat DNS rebinding.
-- Reject non-decimal-dotted IP representations: hex, octal, big-endian integer.
-- Disable redirects on server-side fetches, or validate the redirect target with the same rules.
-- Block non-HTTP(S) schemes: `file://`, `phar://`, `gopher://`, `data://`, `dict://`, etc.
-
-### H5. Do not leak server context through errors, debug pages, or XML processing
-
-CVE-2022-43691 (whoops exposing `$_SERVER` and `$_ENV`, info disclosure of credentials and tokens), CVE-2022-43689 (XML entity expansion in SVG sanitization → DNS-based IP disclosure, an XXE variant).
-
-Rules:
-- Disable verbose error handlers (whoops, debug bars, stack traces) in production. Never include `$_SERVER`/`$_ENV` in any error output that could be reached over the network.
-- When parsing XML or SVG, disable external entity loading: `libxml_disable_entity_loader(true)` (pre-8.0) or pass `LIBXML_NONET | LIBXML_NOENT=0` flags. Disable DOCTYPE processing if not needed.
-- Catch exceptions at controller boundaries and return generic error responses to the client. Log the detail server-side.
-
-### H6. Set secure file and directory permissions; don't create world-writable artifacts
-
-CVE-2023-48648 (CVSS 6.6) was excessive directory permissions — Concrete created folders with `0777` because the permissions argument to `mkdir` was omitted or set too permissively. On shared hosting, this is local privilege escalation.
-
-Rules:
-- Always pass an explicit permissions argument to `mkdir`, `chmod`, `touch`. Use `0755` for directories and `0644` for files unless there is a documented reason otherwise.
-- Never `chmod 0777` anything. If you find yourself wanting to, the right fix is changing ownership, not loosening permissions.
-
-### H7. Keep dependencies patched and pinned
-
-Dependency CVEs ship through Concrete every year: Guzzle (CVE-2023-29197), enshrined/svg-sanitized (CVE-2025-55166), Symfony PATH_INFO (CVE-2025-64500), historically Laminas/Zend Mail and league/oauth2-server.
-
-Rules:
-- Treat upstream CVEs in `composer.lock` as real CVEs for your site. Update on the same cadence as core.
-- When you write new code that depends on third-party PHP libraries, prefer packages already in Concrete's composer tree to avoid pulling in new attack surface.
+1. **New/modified controller actions** — HTTP method, what it mutates, CSRF token, permission check, blast-radius match. → C4, C5, H2
+2. **GET routes that write/delete/install/update/approve/download** — should be POST + token. → H2, C4
+3. **Object loads by integer ID** — per-object `canView*()` / `canEdit*()` before return/mutate. → H3
+4. **File upload handlers** — content/magic-byte validation before `move_uploaded_file`; non-executable destination; no `uniqid()` for security; redirects disabled. → C2
+5. **Template/path/filename inputs** — whitelist, `..`/null-byte/scheme rejection *after* decoding, `realpath()` confinement. → C3
+6. **`unserialize(`, dynamic `include`/`require`, stream wrappers** — any of these reading DB/request/config = block the PR. → C1, C3
+7. **Template output** — every interpolation through `h()` or Twig, including attribute values and translation arguments. → H1
+8. **OAuth / auth callbacks** — `state`, session regen, `uIsActive`, current-password re-verify, field whitelist. → C7
+9. **URL fetches** — private/metadata IP block, DNS rebinding, scheme restrictions, redirect handling. → H4
+10. **Auth/guard comparisons** — `===` or `hash_equals()`; source-of-request validation. → C6
+11. **Account/permission mutations** — action-specific permission, not just `canAccess()`. → C5, C7
+12. **`composer.json`/`composer.lock` changes** — new deps inherit their CVE history. → H7
 
 ---
 
-## Anti-patterns from real CVEs
+## Critical patterns (CVSS 7+ outcomes)
 
-If you find yourself writing code that matches any of these shapes, stop and reconsider.
-
-**A. State-changing GET route with no token check** (CVE-2023-48652, CVE-2023-48653, CVE-2026-8411, and ~15 siblings):
+### C1. Never `unserialize()` data from DB, request, or block config
 
 ```php
-public function delete()
-{
-    if ($this->canEditPages()) {
-        $this->deletePages($_GET['cIDs']);
-    }
+// DON'T
+$config = unserialize($this->btTable_filterFields);
+
+// DO
+$config = json_decode($this->btTable_filterFields, true);
+if (!is_array($config) || !isset($config['expected_key'])) {
+    throw new \UnexpectedValueException('Invalid config');
 }
 ```
 
-The permission check is necessary but not sufficient. Validate a CSRF token tied to a specific action name, and prefer POST for state changes.
+- No `unserialize()` on values from DB, request, files, or any admin/attacker-influenced channel.
+- `json_decode()` against a known schema; validate structure before use.
+- `phar://` also deserializes — filter `phar:` from any path passed to `file_exists`, `is_file`, `fopen`, `include`.
+- Block-config columns holding serialized PHP (`btTable_filterFields`, `btTable_columns`) are smells. Migrate to JSON.
+- If migration is impossible: `unserialize($data, ['allowed_classes' => false])`, then validate.
 
-**B. unserialize on database-stored block configuration** (CVE-2021-40102, CVE-2026-3452, CVE-2026-8135):
+### C2. Validate uploads by content *before* writing; never trust extension
 
 ```php
-$config = unserialize($this->btTable_filterFields);
+// DON'T — race window: attacker can execute before unlink
+move_uploaded_file($_FILES['f']['tmp_name'], $dest);
+if (!$this->extensionAllowed($dest)) { unlink($dest); }
+
+// DO — validate magic bytes / mime before any write
+if (!in_array(mime_content_type($_FILES['f']['tmp_name']), $allowedMimes, true)
+    || !$this->validateMagicBytes($_FILES['f']['tmp_name'])) {
+    throw new \RuntimeException('Rejected');
+}
+move_uploaded_file($_FILES['f']['tmp_name'], $nonExecutablePath);
 ```
 
-Store configuration as JSON; parse with `json_decode` against a known schema. If you genuinely cannot migrate, use `unserialize($data, ['allowed_classes' => false])` and validate the result.
+- Reject by content type and magic bytes, not extension. `.png` containing `<?php` must fail at validation, not get cleaned up after.
+- Validate before bytes hit any path under webroot, `application/`, or `DIR_PACKAGES`.
+- No `uniqid()` for security-sensitive paths — predictable. Use `bin2hex(random_bytes(16))`.
+- Disable redirects on server-side fetches that will be unpacked/executed; validate final URL.
+- ZIP/archive extraction: validate every entry name for traversal before extracting (zip-slip).
 
-**C. IDOR via sequential integer ID** (CVE-2021-22967, CVE-2023-48653, CVE-2026-8236/8237/8238/8239 and several others):
+### C3. Whitelist any input becoming a file path or template name
 
 ```php
-public function view($fID)
-{
-    $file = File::getByID($fID);
+// DON'T
+include DIR_BASE . '/application/blocks/' . $type . '/' . $template . '.php';
+
+// DO
+if (!preg_match('/^[A-Za-z0-9_-]+$/', $template)) {
+    throw new \InvalidArgumentException('Invalid template name');
+}
+$base = DIR_BASE . '/application/blocks/' . $type;
+$full = realpath($base . '/' . $template . '.php');
+if ($full === false || strpos($full, realpath($base) . DIRECTORY_SEPARATOR) !== 0) {
+    throw new \RuntimeException('Path escapes base');
+}
+include $full;
+```
+
+- Whitelist `[A-Za-z0-9_-]`. Reject `..`, absolute paths, null bytes, stream wrappers — *after* URL/path decoding (`..%2f`, `..%252f` are real).
+- `realpath()`-confirm the result is under the intended root before opening.
+- Template-name fields are code, not data — the framework will include the resolved path.
+
+### C4. Package/marketplace/update endpoints need CSRF tokens, even on GET
+
+```php
+// DO
+public function do_update() {
+    if (!$this->canUpgrade()) throw new UserMessageException(t('Access Denied'));
+    $token = $this->app->make('token');
+    if (!$token->validate('do_core_update')) {
+        throw new UserMessageException($token->getErrorMessage());
+    }
+    $this->performCoreUpdate($this->request->request->get('version'));
+}
+```
+
+- Any route that fetches, installs, or executes code from a remote identifier (marketplace ID, package handle, version) is a CSRF-to-RCE target by default.
+- Routes writing under `DIR_PACKAGES` or upgrading core MUST validate a token. Permission alone is insufficient.
+- Reject GET where possible; require POST with action-scoped token.
+
+### C5. Authorization must match the action's blast radius
+
+```php
+// DON'T — page-view permission gating a privilege-escalating mutation
+if (!$this->canAccess()) throw new UserMessageException(t('Access Denied'));
+$this->addUsersToGroup($_POST['users'], $_POST['gID']);
+
+// DO — permission scoped to what's being granted
+$group = Group::getByID((int) $this->request->request->get('gID'));
+if (!$group || !$this->currentUserCanAssignToGroup($group)) {
+    throw new UserMessageException(t('Access Denied'));
+}
+// ... plus CSRF token check ...
+```
+
+- Page-view permission ≠ mutate permission. Each action method needs a check matching what it can do.
+- Adding to Administrators requires Administrator-level authority.
+- Group-membership, permission-grant, and user-role changes are privilege-escalation-adjacent — check must be at least as strict as the privilege granted.
+
+### C6. `===` and `hash_equals()`; validate request *source*, not just field values
+
+```php
+// DON'T — json_decode("true") returns PHP true, defeating the guard
+if ($request->request->get('_fromCIF') === true) { /* skip validation */ }
+
+// DO — validate the source (route, internal caller, auth context)
+if ($this->isInternalCIFImport() && $this->authenticatedCaller()) { /* ... */ }
+// constant-time for opaque tokens
+if (hash_equals($expectedToken, $providedToken)) { /* ... */ }
+```
+
+- `===` / `!==` everywhere in auth, authorization, guard code, and token checks.
+- `hash_equals()` for opaque tokens (OAuth `state`, CSRF, password hashes, API keys).
+- Validate request source — controller path, HTTP method, authenticated caller — not just a flag in the body.
+
+### C7. Re-auth for credential changes; `uIsActive` on every auth path
+
+```php
+// DO — field whitelist plus current-password re-verify
+$fields = $this->request->request->only(['uFirstName', 'uLastName', 'uTimezone']);
+if ($this->request->request->has('uPassword')) {
+    if (!$this->verifyCurrentPassword($this->request->request->get('uPasswordCurrent'))) {
+        throw new UserMessageException(t('Current password required'));
+    }
+    $fields['uPassword'] = $this->request->request->get('uPassword');
+}
+$this->getUserInfo()->update($fields);
+```
+
+- Whitelist accepted fields. Never `$request->request->all()` to a model update.
+- Password / email / 2FA / session-hardening changes need current-password (or fresh factor) re-verify server-side.
+- `uIsActive` checked at every auth path: username/password, OAuth, API tokens, "remember me", password-reset, SAML.
+- OAuth callbacks specifically: validated `state`, regenerated session ID post-auth, `uIsActive` before issuing tokens, escaped integration metadata in views.
+
+---
+
+## High-frequency patterns (bulk of CVE volume)
+
+### H1. HTML-escape every user-controllable string on output
+
+```php
+// DON'T
+<h2><?= $integration->getName() ?></h2>
+<a href="<?= $url ?>">link</a>
+<?= t('Welcome %s', $userName) ?>
+
+// DO — h() everywhere; Twig auto-escapes
+<h2><?= h($integration->getName()) ?></h2>
+<a href="<?= h($url) ?>">link</a>
+<?= t('Welcome %s', h($userName)) ?>
+```
+
+- `h()` (or `app('helper/text')->entities()`) on every user-controllable string in PHP templates.
+- Prefer Twig for new templates — auto-escapes by default.
+- Translation helpers do NOT sanitize. Escape input *before* it enters a format string.
+- Attribute values need escaping (`href`, `value`, `data-*`, `style`).
+- Numeric-looking fields aren't safe — cast or validate types explicitly.
+- Any name/title/label field an editor controls is a potential XSS payload.
+
+### H2. CSRF token on every state-changing request
+
+```php
+// DO
+public function delete() {
+    if (!$this->canEditPages()) throw new UserMessageException(t('Access Denied'));
+    $token = $this->app->make('token');
+    if (!$token->validate('delete_pages')) {
+        throw new UserMessageException($token->getErrorMessage());
+    }
+    $this->deletePages($this->request->request->get('cIDs'));
+}
+```
+
+- State-changing GETs are CSRF-vulnerable. Validate a token regardless of HTTP method; prefer POST.
+- Emitting a token in the view does not validate it.
+- Test by removing the token — the action must fail. Inverted checks are real CVEs.
+- Use action-scoped token names (`delete_pages`, `update_core`), not a single global token.
+
+### H3. Per-object permission check on every load
+
+```php
+// DO
+public function view($fID) {
+    $file = File::getByID((int) $fID);
+    if (!$file || !(new Checker($file))->canViewFile()) {
+        return new JsonResponse(['error' => 'Not found'], 404); // not 403
+    }
     return new JsonResponse($file->getJSONObject());
 }
 ```
 
-Check `canViewFile()` (or the analogous permission) before returning. Return 404 — not 403 — for objects the user cannot see, to avoid leaking existence. Prefer UUID identifiers in URLs.
+- Every controller that loads an object by ID checks the relevant permission before returning or mutating.
+- 404 for objects the user can't see (not 403) — avoids existence disclosure.
+- Frontend/dialog/REST endpoints have a poor history; checks are not optional there.
+- Prefer public-identifier (UUID) URLs over sequential integers. The 9.5.1 Express Entry rewrite did exactly this.
 
-**D. Admin-supplied string rendered raw** (every stored-XSS CVE in this list, ~30 of them):
-
-```php
-<h2><?= $integration->getName() ?></h2>
-```
-
-`<h2><?= h($integration->getName()) ?></h2>`, or use Twig.
-
-**E. Page-view permission gating mutation actions** (CVE-2021-22966, CVE-2026-8350):
+### H4. Validate and pin URL fetch destinations
 
 ```php
-public function bulkAssign()
-{
-    if (!$this->canAccess()) {
-        throw new UserMessageException(t('Access Denied'));
-    }
-    // ... add arbitrary users to arbitrary groups ...
-}
+// DO
+$url = $this->validateExternalUrl($request->request->get('feed_url'));
+$ip = $this->resolveAndValidateIp($url); // reject private/metadata
+$body = $this->fetchByIp($url, $ip, ['follow_redirects' => false]);
 ```
 
-Check the action-specific permission. Adding a user to Administrators requires Administrator-level authority, not page-view authority.
+- Resolve hostname yourself; reject private ranges (RFC1918, link-local, loopback, IPv6 equivalents, IPv4-mapped IPv6, cloud metadata `169.254.169.254`).
+- Connect using validated IP, not hostname, to defeat DNS rebinding.
+- Reject non-decimal-dotted IPs (hex, octal, big-endian integer).
+- Disable redirects, or re-validate redirect targets with the same rules.
+- Block non-HTTP(S) schemes: `file://`, `phar://`, `gopher://`, `data://`, `dict://`.
+- Use `Concrete\Core\Url\Validation` utilities added in 9.5.1.
 
-**F. Path field concatenated into a template path** (CVE-2021-40097/40098, CVE-2022-30117, CVE-2026-8134):
+### H5. No verbose error handlers; no XXE-able XML in production
+
+- Disable whoops and verbose handlers in production. Catch exceptions at controller boundaries; generic error to client; detail to server log.
+- Never include `$_SERVER` / `$_ENV` in network-reachable error output.
+- For XML/SVG: refuse external entities (`libxml_set_external_entity_loader`), set `LIBXML_NONET`, disable DOCTYPE if not needed.
+
+### H6. Explicit file/directory permissions; never 0777
 
 ```php
-$template = $request->request->get('template');
-include DIR_BASE . '/application/blocks/' . $type . '/' . $template . '.php';
+// DON'T            // DO
+mkdir($path);       mkdir($path, 0755, true);
+chmod($f, 0777);    chmod($f, 0644);
 ```
 
-Whitelist `$template` against `[A-Za-z0-9_-]+`, reject any value containing `.` or `/`, and `realpath()`-confirm the final path is under the intended root.
+- Always pass explicit perms to `mkdir`, `chmod`, `touch`. `0755` dirs, `0644` files.
+- If `0777` seems necessary, the fix is changing ownership, not loosening permissions.
 
-**G. File upload validated after writing to disk** (Fortbridge 2021 race-condition RCE, CVE-2026-8134):
+### H7. Keep dependencies patched
 
-```php
-move_uploaded_file($_FILES['f']['tmp_name'], $dest);
-if (!$this->validateExtension($dest)) {
-    unlink($dest);
-    throw new Exception('Bad file');
-}
-```
-
-Validate `$_FILES['f']['tmp_name']` content and magic bytes *before* moving anywhere reachable. If you must inspect after writing, write to a non-executable path outside the webroot.
-
-**H. Loose comparison or json_decode-based guard** (CVE-2022-43690, CVE-2026-8135):
-
-```php
-if ($request->request->get('_fromCIF') === true) {
-    // skip validation
-}
-```
-
-`json_decode("true")` returns PHP `true` and bypasses this. Validate the *source* of the request (controller path, internal call, authenticated caller), not a flag inside the request body.
-
-**I. Raw $_POST to model update** (CVE-2021-40101, CVE-2026-8327):
-
-```php
-$userInfo->update($request->request->all());
-```
-
-Whitelist accepted fields. Require current-password verification for password/email/2FA changes.
-
-**J. OAuth handler without state, session rotation, or active-account check** (CVE-2022-43687, CVE-2022-43693, CVE-2026-7887, CVE-2026-8197):
-
-OAuth callbacks need: validated `state` parameter, regenerated session ID after successful auth, `uIsActive` check before issuing tokens, escaped integration metadata in any view.
+- Upstream CVEs in `composer.lock` are real CVEs for the site. Update on the same cadence as core.
+- Prefer libraries already in Concrete's tree over pulling new packages.
+- Watch in particular: Guzzle, Symfony components, league/oauth2-server, enshrined/svg-sanitized, Laminas/Zend Mail.
 
 ---
 
 ## Pre-flight checklist
 
-Before you finish writing any Concrete CMS PHP, walk this list. If you cannot answer all eight with "yes" or "not applicable," fix the code first.
+Answer each with "yes" or "not applicable" before submitting:
 
-1. **State change?** If this code mutates anything, is a CSRF token validated (not just emitted)? Does the check fail closed when the token is missing?
-2. **Object load by ID?** Is there a per-object permission check before returning or mutating? Does the response avoid distinguishing "doesn't exist" from "you can't see it" when that distinction is unsafe?
-3. **User-controllable string in output?** Is every interpolation HTML-escaped — including admin-supplied strings, strings inside attributes, and strings going through `t()`?
-4. **Deserialization or template path?** Any `unserialize()`, `include`/`require` of a dynamic path, template-name field, or stream wrapper? If so: schema-validated, whitelisted, and not reachable from admin block config or untrusted input?
-5. **File upload?** Validated by content and magic bytes before any write to a webroot-reachable path? No reliance on `uniqid()` for security?
-6. **Server-side URL fetch?** Destination validated against private IPs, with DNS rebinding mitigated, non-HTTP schemes blocked, and redirects either disabled or re-validated?
-7. **Account-state change?** Re-authentication required for password/email/2FA changes? Field whitelist on the update? `uIsActive` checked on every auth path including OAuth?
-8. **Privilege boundary?** Is the permission check matched to the action's blast radius, not just to the page's view permission? Are security comparisons using `===` / `hash_equals()`?
+1. **State change?** CSRF token validated (not just emitted), fails closed when missing?
+2. **Object load by ID?** Per-object permission check before return/mutate? 404 for hidden objects?
+3. **User-controllable output?** Every interpolation escaped — admin strings, attribute values, translation arguments?
+4. **Deserialization or template path?** No `unserialize()` / dynamic include reachable from DB, request, or admin block config?
+5. **File upload?** Content/magic-byte validation *before* write to webroot-reachable path? No `uniqid()` for security?
+6. **Server-side URL fetch?** Private/metadata IPs blocked, DNS rebinding mitigated, schemes restricted, redirects disabled or re-validated?
+7. **Account-state change?** Current-password verified for credential changes, field whitelist on updates, `uIsActive` on every auth path?
+8. **Privilege boundary?** Permission matches action blast radius (not page-view)? `===` / `hash_equals()` in security comparisons?
 
-## When in doubt
+---
 
-- **Mirror 9.5.1-era controllers**, not older ones. Many controllers under `concrete/controllers/dialog`, `concrete/controllers/backend/file`, and `concrete/controllers/single_page/dashboard/extend` were the *source* of CVEs and were rewritten in 9.5.1. Use the post-patch version as your model.
-- **Default to Twig** for new view templates. Auto-escaping eliminates an entire class of mistake.
-- **Slow down on Express, Conversations, Calendar, OAuth, Marketplace, and the file uploader.** These subsystems have been disproportionately responsible for high-severity CVEs across all four years.
-- **If you are unsure whether a check is needed, add it.** The cost of a redundant `canView` is zero; the cost of a missing one is a CVE.
+## Threat model & history
+
+**Three actor profiles** dominate the CVE history:
+
+1. **Rogue admin / editor** — has elevated privileges; explicitly in-scope per Concrete's security team. Admin-supplied strings must still be HTML-encoded; admin-supplied serialized data must not reach `unserialize()`; admin-supplied paths must be whitelist-validated.
+2. **Unauthenticated CSRF attacker** with an authenticated victim — most chains target admin sessions. Every state-changing request validates a token.
+3. **Unauthenticated outsider** hitting a public endpoint — dialog/frontend/REST endpoints have repeatedly leaked data without auth. Every endpoint is unauthenticated until proven otherwise.
+
+**Patterns recur — none of these rules are theoretical.** Each maps to multiple disclosed CVEs:
+
+- **H1** admin-controlled XSS — 30+ CVEs across 2022–2026, every year
+- **H2** state-change CSRF — 20+ CVEs, mostly batched in 9.5.1 after years of accumulation
+- **H3** sequential-ID IDOR — 10+ CVEs (flagged CVE-2023-48653, exploded in 9.5.1)
+- **C7** OAuth + credential re-auth — CVE-2021-40101 + CVE-2026-8327 (password-no-reverify, 5yr gap); CVE-2022-43687 (session fix), CVE-2022-43693 (missing `state`), CVE-2026-7887 (missing `uIsActive`)
+- **C1** unserialize / PHAR — CVE-2021-40102, CVE-2026-3452, CVE-2026-8135
+- **C2/C3** file & path RCE — 2021 Fortbridge race + `uniqid`, CVE-2022-21829, CVE-2026-8134
+- **C6** type-juggling guards — CVE-2022-43690 (loose `==`), CVE-2026-8135 (`json_decode("true")`)
+- **H4** SSRF in URL fetchers — CVE-2021-22969/22970/40109, CVE-2026-7890
+- **H5** error/XML info disclosure — CVE-2022-43689 (SVG XXE), CVE-2022-43691 (whoops)
+
+**Repeat-offender subsystems**: Express blocks, OAuth callbacks, marketplace/extend controllers, file uploader, dashboard dialog controllers. Mirror 9.5.1-era post-rewrite versions, not pre-rewrite originals.
